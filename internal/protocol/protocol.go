@@ -35,6 +35,18 @@ const (
 	// TypePeerJoined/TypePeerLeft 用于维护在线成员列表。
 	TypePeerJoined = "peer_joined"
 	TypePeerLeft   = "peer_left"
+	// TypeJoinPending 表示协作者已通过 roomKey 鉴权，但还在等待房主批准。
+	TypeJoinPending = "join_pending"
+	// TypeJoinRequest 由服务端发给房主，请求房主批准某个协作者加入。
+	TypeJoinRequest = "join_request"
+	// TypeJoinDecision 由房主发回服务端，批准或拒绝某个待加入连接。
+	TypeJoinDecision = "join_decision"
+	// TypeJoinRejected 表示房主拒绝、审批超时或房间无法继续加入。
+	TypeJoinRejected = "join_rejected"
+	// TypePeerKick 由房主发给服务端，用于踢出指定协作者。
+	TypePeerKick = "peer_kick"
+	// TypePeerKicked 由服务端发给被踢出的协作者。
+	TypePeerKicked = "peer_kicked"
 	// TypeRoomClosed 表示房主已经离开，房间生命周期结束，其他协作者必须退出当前协作。
 	TypeRoomClosed = "room_closed"
 	// TypeError 是结构化错误，前端可以直接映射为 toast 或状态栏文案。
@@ -121,6 +133,43 @@ type AuthOKPayload struct {
 	Updates            []StoredUpdate `json:"updates,omitempty"`
 	IsHost             bool           `json:"isHost"`
 	HostID             string         `json:"hostId,omitempty"`
+}
+
+// JoinPendingPayload 告诉待加入者：连接和 roomKey 已通过，正在等待房主审批。
+type JoinPendingPayload struct {
+	HostID string `json:"hostId,omitempty"`
+}
+
+// JoinRequestPayload 是服务端发给房主的审批请求。
+// User 已经被服务端清洗过，并且 ID 是房间内唯一连接 ID。
+type JoinRequestPayload struct {
+	RequestID string `json:"requestId"`
+	User      User   `json:"user"`
+}
+
+// JoinDecisionPayload 是房主对待加入连接的审批结果。
+type JoinDecisionPayload struct {
+	RequestID string `json:"requestId"`
+	ClientID  string `json:"clientId,omitempty"`
+	Approved  bool   `json:"approved"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// JoinRejectedPayload 告诉待加入者为什么没有进入房间。
+type JoinRejectedPayload struct {
+	Reason string `json:"reason"`
+}
+
+// PeerKickPayload 是房主踢人的控制消息。
+type PeerKickPayload struct {
+	ClientID string `json:"clientId"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// PeerKickedPayload 告诉被踢出的客户端需要退出当前协作。
+type PeerKickedPayload struct {
+	Reason string `json:"reason,omitempty"`
+	By     string `json:"by,omitempty"`
 }
 
 // RoomClosedPayload 告诉客户端房间已经结束。

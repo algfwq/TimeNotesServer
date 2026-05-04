@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 
@@ -89,12 +90,17 @@ func TestHostLeaveClosesRoom(t *testing.T) {
 	}
 
 	host := &Client{id: "host", roomID: roomID, user: protocol.User{ID: "host", Name: "房主"}, send: make(chan protocol.Envelope, 4), hub: hub}
-	room := hub.joinRoom(host, storage.RoomState{})
+	room, joined := hub.joinRoom(host, storage.RoomState{})
+	if !joined {
+		t.Fatalf("host should join immediately")
+	}
 	if host.user.Role != "host" || room.hostID != host.id {
 		t.Fatalf("first client should become host, role=%s host=%s", host.user.Role, room.hostID)
 	}
 	guest := &Client{id: "guest", roomID: roomID, user: protocol.User{ID: "guest", Name: "协作者"}, send: make(chan protocol.Envelope, 4), hub: hub}
-	hub.joinRoom(guest, storage.RoomState{})
+	if !joinApproved(t, hub, guest, room) {
+		t.Fatalf("guest should join after approval")
+	}
 	if guest.user.Role != "collaborator" {
 		t.Fatalf("second client should become collaborator, got %s", guest.user.Role)
 	}
@@ -113,4 +119,114 @@ func TestHostLeaveClosesRoom(t *testing.T) {
 	if err := store.EnsureRoom(context.Background(), roomID, keyHash); !errors.Is(err, storage.ErrRoomClosed) {
 		t.Fatalf("closed room should reject future joins, got %v", err)
 	}
+}
+
+func TestJoinRoomRequiresHostApproval(t *testing.T) {
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "collab.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	hub := NewHub(store, "test-secret")
+	roomID := "room-approval"
+	if err := store.EnsureRoom(context.Background(), roomID, hub.roomKeyHash(roomID, "room-key")); err != nil {
+		t.Fatalf("ensure room: %v", err)
+	}
+
+	host := &Client{id: "host", roomID: roomID, user: protocol.User{ID: "host", Name: "房主"}, send: make(chan protocol.Envelope, 8), hub: hub}
+	room, joined := hub.joinRoom(host, storage.RoomState{})
+	if !joined {
+		t.Fatalf("host should join")
+	}
+	guest := &Client{id: "guest", roomID: roomID, user: protocol.User{ID: "guest", Name: "协作者"}, send: make(chan protocol.Envelope, 8), hub: hub}
+
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := hub.joinRoom(guest, storage.RoomState{})
+		done <- ok
+	}()
+	pending := waitPendingJoin(t, room, "guest")
+	if pending == nil {
+		t.Fatalf("guest should become pending before approval")
+	}
+	if _, exists := room.clients["guest"]; exists {
+		t.Fatalf("pending guest must not be active before approval")
+	}
+	pending.decide(joinDecision{approved: true})
+	if !<-done {
+		t.Fatalf("guest should join after host approval")
+	}
+	if _, exists := room.clients["guest"]; !exists {
+		t.Fatalf("approved guest should be active")
+	}
+}
+
+func TestHostCanKickCollaborator(t *testing.T) {
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "collab.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	hub := NewHub(store, "test-secret")
+	roomID := "room-kick"
+	if err := store.EnsureRoom(context.Background(), roomID, hub.roomKeyHash(roomID, "room-key")); err != nil {
+		t.Fatalf("ensure room: %v", err)
+	}
+
+	host := &Client{id: "host", roomID: roomID, user: protocol.User{ID: "host", Name: "房主"}, send: make(chan protocol.Envelope, 8), hub: hub}
+	room, joined := hub.joinRoom(host, storage.RoomState{})
+	if !joined {
+		t.Fatalf("host should join")
+	}
+	guest := &Client{id: "guest", roomID: roomID, user: protocol.User{ID: "guest", Name: "协作者"}, send: make(chan protocol.Envelope, 8), hub: hub}
+	if !joinApproved(t, hub, guest, room) {
+		t.Fatalf("guest should join after approval")
+	}
+
+	payload := protocol.PeerKickPayload{ClientID: guest.id}
+	raw, _ := json.Marshal(payload)
+	host.handleEnvelope(room, protocol.Envelope{Version: protocol.Version, Type: protocol.TypePeerKick, Payload: raw})
+	if _, exists := room.clients[guest.id]; exists {
+		t.Fatalf("kicked guest should be removed from active clients")
+	}
+	foundKicked := false
+	for env := range guest.send {
+		if env.Type == protocol.TypePeerKicked {
+			foundKicked = true
+			break
+		}
+	}
+	if !foundKicked {
+		t.Fatalf("kicked guest should receive peer_kicked")
+	}
+}
+
+func joinApproved(t *testing.T, hub *Hub, client *Client, room *Room) bool {
+	t.Helper()
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := hub.joinRoom(client, storage.RoomState{})
+		done <- ok
+	}()
+	pending := waitPendingJoin(t, room, client.id)
+	if pending == nil {
+		return false
+	}
+	pending.decide(joinDecision{approved: true})
+	return <-done
+}
+
+func waitPendingJoin(t *testing.T, room *Room, clientID string) *PendingJoin {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		room.mu.RLock()
+		pending := room.pending[clientID]
+		room.mu.RUnlock()
+		if pending != nil {
+			return pending
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil
 }

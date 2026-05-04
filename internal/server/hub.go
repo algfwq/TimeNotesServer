@@ -22,6 +22,7 @@ import (
 )
 
 const defaultMaxMessageBytes = 64 * 1024 * 1024
+const joinApprovalTimeout = 60 * time.Second
 
 // HubOptions 是协作协调器的运行参数，由 JSON 配置文件传入。
 type HubOptions struct {
@@ -54,8 +55,35 @@ type Room struct {
 	closed bool
 	// clients 是当前在线连接表。连接 ID 由服务端 joinRoom 最终确认，避免多个浏览器窗口共用本地 ID 时互相覆盖。
 	clients map[string]*Client
+	// pending 是已经通过 roomKey 鉴权、但还没有被房主批准的连接。
+	// 待审批连接不能收发文档、聊天、presence 或 WebRTC 信令，只有批准后才进入 clients。
+	pending map[string]*PendingJoin
 	// 房间内广播、定向投递、成员加入/离开都会访问 clients，需要读写锁保护。
 	mu sync.RWMutex
+}
+
+// PendingJoin 代表一条等待房主审批的连接。
+// result 是 1 容量通道，保证房主重复点击同一个审批请求时不会阻塞服务端读循环。
+type PendingJoin struct {
+	requestID string
+	client    *Client
+	state     storage.RoomState
+	createdAt time.Time
+	result    chan joinDecision
+}
+
+type joinDecision struct {
+	approved bool
+	reason   string
+}
+
+func (pending *PendingJoin) decide(decision joinDecision) bool {
+	select {
+	case pending.result <- decision:
+		return true
+	default:
+		return false
+	}
 }
 
 // Client 代表一条已经鉴权的 WebSocket 连接。
@@ -152,13 +180,20 @@ func (h *Hub) handleSocket(conn *websocket.Conn) {
 		_ = conn.Close()
 		return
 	}
-	room := h.joinRoom(client, state)
+	// 写循环要先启动：协作者进入待审批状态时，服务端需要立即发 join_pending；
+	// 如果房主拒绝或审批超时，也要通过同一写队列把 join_rejected 发回去。
+	go client.writeLoop()
+
+	room, joined := h.joinRoom(client, state)
+	if !joined {
+		log.Printf("collab ws join_rejected room=%s client=%s user=%q", client.roomID, client.id, client.user.Name)
+		return
+	}
 	// readLoop 返回代表连接已经断开或无法继续读，此时必须从在线房间移除并广播 peer_left。
 	defer h.leaveRoom(room, client)
 
 	log.Printf("collab ws connected room=%s client=%s user=%q", client.roomID, client.id, client.user.Name)
 	// 读写循环分离：读循环负责解析客户端消息，写循环串行消费 send 队列。
-	go client.writeLoop()
 	client.readLoop(room)
 }
 
@@ -235,15 +270,15 @@ func (h *Hub) room(roomID string) *Room {
 	defer h.mu.Unlock()
 	room := h.rooms[roomID]
 	if room == nil {
-		room = &Room{id: roomID, clients: make(map[string]*Client)}
+		room = &Room{id: roomID, clients: make(map[string]*Client), pending: make(map[string]*PendingJoin)}
 		h.rooms[roomID] = room
 	}
 	return room
 }
 
-// joinRoom 在房间锁内完成唯一连接 ID 分配、在线成员快照和成员表写入。
-// 这里修复了同一浏览器多窗口共享 localStorage ID 导致互相覆盖的问题。
-func (h *Hub) joinRoom(client *Client, state storage.RoomState) *Room {
+// joinRoom 在房间锁内完成唯一连接 ID 分配、房主审批、在线成员快照和成员表写入。
+// 第一位进入房间的连接直接成为房主；后续协作者必须先进入 pending，房主批准后才能进入 clients。
+func (h *Hub) joinRoom(client *Client, state storage.RoomState) (*Room, bool) {
 	room := h.room(client.roomID)
 
 	room.mu.Lock()
@@ -255,32 +290,99 @@ func (h *Hub) joinRoom(client *Client, state storage.RoomState) *Room {
 	if isHost {
 		room.hostID = client.id
 		client.user.Role = "host"
-	} else {
-		client.user.Role = "collaborator"
+		peers := room.peersLocked(client.id)
+		room.clients[client.id] = client
+		client.queue(protocol.NewEnvelope(protocol.TypeAuthOK, "server", client.id, protocol.AuthOKPayload{
+			ClientID:           client.id,
+			Peers:              peers,
+			CompactStateBase64: protocol.EncodeBytes(state.CompactState),
+			Updates:            storedUpdatesForProtocol(state.Updates),
+			IsHost:             true,
+			HostID:             room.hostID,
+		}))
+		total := len(room.clients)
+		room.mu.Unlock()
+
+		if requestedID != client.id {
+			log.Printf("collab client_id rewritten room=%s requested=%s assigned=%s", client.roomID, requestedID, client.id)
+		}
+		log.Printf("collab join room=%s client=%s role=%s host=%s peers_sent=%d notified=0 total=%d updates=%d compact_bytes=%d", client.roomID, client.id, client.user.Role, room.hostID, len(peers), total, len(state.Updates), len(state.CompactState))
+		return room, true
 	}
-	// peers 快照要在把自己插入 clients 之前取，避免 auth_ok 里包含自己。
-	peers := room.peersLocked(client.id)
-	room.clients[client.id] = client
-	total := len(room.clients)
-	room.mu.Unlock()
 
 	if requestedID != client.id {
 		log.Printf("collab client_id rewritten room=%s requested=%s assigned=%s", client.roomID, requestedID, client.id)
 	}
+	client.user.Role = "collaborator"
+	pending := &PendingJoin{
+		requestID: protocol.NewID("join"),
+		client:    client,
+		state:     state,
+		createdAt: time.Now(),
+		result:    make(chan joinDecision, 1),
+	}
+	room.pending[client.id] = pending
+	host := room.clients[room.hostID]
+	if room.closed || host == nil {
+		delete(room.pending, client.id)
+		room.mu.Unlock()
+		client.queue(protocol.NewEnvelope(protocol.TypeJoinRejected, "server", client.id, protocol.JoinRejectedPayload{Reason: "房间已关闭或房主已离线"}))
+		close(client.send)
+		return room, false
+	}
+	client.queue(protocol.NewEnvelope(protocol.TypeJoinPending, "server", client.id, protocol.JoinPendingPayload{HostID: room.hostID}))
+	host.queue(protocol.NewEnvelope(protocol.TypeJoinRequest, "server", room.hostID, protocol.JoinRequestPayload{RequestID: pending.requestID, User: client.user}))
+	room.mu.Unlock()
 
-	// auth_ok 只发给当前连接：包含服务端确认后的 clientId、当前在线成员、以及可重放的 Yjs 状态。
+	log.Printf("collab join_pending room=%s client=%s host=%s request=%s", client.roomID, client.id, room.hostID, pending.requestID)
+
+	decision := joinDecision{approved: false, reason: "房主审批超时"}
+	select {
+	case decision = <-pending.result:
+	case <-time.After(joinApprovalTimeout):
+	}
+
+	room.mu.Lock()
+	current := room.pending[client.id]
+	if current != pending {
+		room.mu.Unlock()
+		client.queue(protocol.NewEnvelope(protocol.TypeJoinRejected, "server", client.id, protocol.JoinRejectedPayload{Reason: "加入请求已失效"}))
+		close(client.send)
+		return room, false
+	}
+	delete(room.pending, client.id)
+	if !decision.approved {
+		room.mu.Unlock()
+		reason := protocol.CleanText(decision.reason, "房主已拒绝加入", 120)
+		client.queue(protocol.NewEnvelope(protocol.TypeJoinRejected, "server", client.id, protocol.JoinRejectedPayload{Reason: reason}))
+		close(client.send)
+		log.Printf("collab join_denied room=%s client=%s request=%s reason=%q", client.roomID, client.id, pending.requestID, reason)
+		return room, false
+	}
+	if room.closed || room.clients[room.hostID] == nil {
+		room.mu.Unlock()
+		client.queue(protocol.NewEnvelope(protocol.TypeJoinRejected, "server", client.id, protocol.JoinRejectedPayload{Reason: "房间已关闭或房主已离线"}))
+		close(client.send)
+		return room, false
+	}
+	// peers 快照要在把自己插入 clients 之前取，避免 auth_ok 里包含自己。
+	peers := room.peersLocked(client.id)
+	room.clients[client.id] = client
 	client.queue(protocol.NewEnvelope(protocol.TypeAuthOK, "server", client.id, protocol.AuthOKPayload{
 		ClientID:           client.id,
 		Peers:              peers,
-		CompactStateBase64: protocol.EncodeBytes(state.CompactState),
-		Updates:            storedUpdatesForProtocol(state.Updates),
-		IsHost:             isHost,
+		CompactStateBase64: protocol.EncodeBytes(pending.state.CompactState),
+		Updates:            storedUpdatesForProtocol(pending.state.Updates),
+		IsHost:             false,
 		HostID:             room.hostID,
 	}))
-	// peer_joined 发给其他在线成员，用来刷新成员列表并启动 WebRTC offer/answer 交换。
+	total := len(room.clients)
+	room.mu.Unlock()
+
+	// peer_joined 只在审批通过后广播，确保其他客户端不会提前与未获准连接建立 P2P 或显示在线。
 	delivered := room.broadcast(protocol.NewEnvelope(protocol.TypePeerJoined, "server", "", client.user), client.id)
-	log.Printf("collab join room=%s client=%s role=%s host=%s peers_sent=%d notified=%d total=%d updates=%d compact_bytes=%d", client.roomID, client.id, client.user.Role, room.hostID, len(peers), delivered, total, len(state.Updates), len(state.CompactState))
-	return room
+	log.Printf("collab join_approved room=%s client=%s role=%s host=%s request=%s peers_sent=%d notified=%d total=%d updates=%d compact_bytes=%d", client.roomID, client.id, client.user.Role, room.hostID, pending.requestID, len(peers), delivered, total, len(pending.state.Updates), len(pending.state.CompactState))
+	return room, true
 }
 
 // leaveRoom 移除在线连接，并通知其他成员该用户离线。
@@ -297,6 +399,11 @@ func (h *Hub) leaveRoom(room *Room, client *Client) {
 	hostLeft := existed && client.id == room.hostID && !room.closed
 	if hostLeft {
 		room.closed = true
+		// 待审批连接还没有进入 clients，不能收到 room_closed 广播；
+		// 这里直接唤醒它们的审批等待，让 joinRoom 立刻返回拒绝而不是等 60 秒超时。
+		for _, pending := range room.pending {
+			pending.decide(joinDecision{approved: false, reason: "房主已退出协作，房间已关闭"})
+		}
 		closeEnv := protocol.NewEnvelope(protocol.TypeRoomClosed, "server", "", protocol.RoomClosedPayload{Reason: "host_left", HostID: client.id})
 		for id, peer := range room.clients {
 			if peer.queue(closeEnv) {
@@ -357,14 +464,20 @@ func (room *Room) peersLocked(excludeID string) []protocol.User {
 func (room *Room) uniqueClientIDLocked(requestedID string) string {
 	base := protocol.CleanID(requestedID, "client")
 	if _, exists := room.clients[base]; !exists {
-		return base
+		if _, pending := room.pending[base]; !pending {
+			return base
+		}
 	}
 	// 冲突通常来自同一客户端多窗口共享 session/local user id，追加随机后缀即可保持在线列表稳定。
 	for i := 0; i < 8; i++ {
 		candidate := fmt.Sprintf("%s-%s", base, strings.TrimPrefix(protocol.NewID("c"), "c-")[:8])
-		if _, exists := room.clients[candidate]; !exists {
-			return candidate
+		if _, exists := room.clients[candidate]; exists {
+			continue
 		}
+		if _, pending := room.pending[candidate]; pending {
+			continue
+		}
+		return candidate
 	}
 	return protocol.NewID("client")
 }
@@ -553,6 +666,10 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 			delivered = room.broadcast(env, client.id)
 		}
 		log.Printf("collab chat room=%s client=%s message=%s relay=%t delivered=%d", client.roomID, client.id, payload.MessageID, payload.Relay, delivered)
+	case protocol.TypeJoinDecision:
+		client.handleJoinDecision(room, env)
+	case protocol.TypePeerKick:
+		client.handlePeerKick(room, env)
 	case protocol.TypePing:
 		// ping/pong 只用于客户端测量 WebSocket 往返延迟，不访问 SQLite，也不广播给其他成员。
 		payload, err := protocol.DecodePayload[protocol.PingPayload](env)
@@ -583,6 +700,87 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 		log.Printf("collab unknown_type room=%s client=%s type=%s", client.roomID, client.id, env.Type)
 		client.sendError("unknown_type", "未知协作消息类型")
 	}
+}
+
+// handleJoinDecision 只允许房主调用。
+// 服务端不信任客户端传来的 from/to，审批目标必须从 pending 表中查到才会生效。
+func (client *Client) handleJoinDecision(room *Room, env protocol.Envelope) {
+	if client.id != room.hostID {
+		client.sendError("forbidden", "只有房主可以审批协作者加入")
+		return
+	}
+	payload, err := protocol.DecodePayload[protocol.JoinDecisionPayload](env)
+	if err != nil {
+		client.sendError("bad_join_decision", "加入审批格式无效")
+		return
+	}
+	requestID := protocol.CleanText(payload.RequestID, "", 128)
+	targetID := protocol.CleanID(payload.ClientID, "")
+	room.mu.RLock()
+	var pending *PendingJoin
+	if targetID != "" {
+		pending = room.pending[targetID]
+	}
+	if pending == nil && requestID != "" {
+		for _, candidate := range room.pending {
+			if candidate.requestID == requestID {
+				pending = candidate
+				break
+			}
+		}
+	}
+	room.mu.RUnlock()
+	if pending == nil {
+		client.sendError("join_request_expired", "加入请求已失效")
+		return
+	}
+	reason := protocol.CleanText(payload.Reason, "", 120)
+	if reason == "" && !payload.Approved {
+		reason = "房主已拒绝加入"
+	}
+	ok := pending.decide(joinDecision{approved: payload.Approved, reason: reason})
+	log.Printf("collab join_decision room=%s host=%s target=%s request=%s approved=%t delivered=%t", client.roomID, client.id, pending.client.id, pending.requestID, payload.Approved, ok)
+}
+
+// handlePeerKick 只允许房主踢出已经在线的协作者。
+// 被踢者会先收到 peer_kicked，再由服务端关闭其 WebSocket；其他成员收到 peer_left 刷新在线列表。
+func (client *Client) handlePeerKick(room *Room, env protocol.Envelope) {
+	if client.id != room.hostID {
+		client.sendError("forbidden", "只有房主可以踢出协作者")
+		return
+	}
+	payload, err := protocol.DecodePayload[protocol.PeerKickPayload](env)
+	if err != nil {
+		client.sendError("bad_peer_kick", "踢出协作者请求格式无效")
+		return
+	}
+	targetID := protocol.CleanID(payload.ClientID, "")
+	if targetID == "" || targetID == client.id {
+		client.sendError("bad_peer_kick", "不能踢出该成员")
+		return
+	}
+	reason := protocol.CleanText(payload.Reason, "房主已将你移出协作房间", 120)
+
+	room.mu.Lock()
+	target := room.clients[targetID]
+	if target == nil {
+		room.mu.Unlock()
+		client.sendError("peer_not_found", "协作者不在线或已离开")
+		return
+	}
+	if target.id == room.hostID {
+		room.mu.Unlock()
+		client.sendError("bad_peer_kick", "不能踢出房主")
+		return
+	}
+	delete(room.clients, targetID)
+	target.queue(protocol.NewEnvelope(protocol.TypePeerKicked, "server", targetID, protocol.PeerKickedPayload{Reason: reason, By: client.id}))
+	close(target.send)
+	total := len(room.clients)
+	room.mu.Unlock()
+
+	delivered := room.broadcast(protocol.NewEnvelope(protocol.TypePeerLeft, "server", "", fiber.Map{"clientId": targetID}), targetID)
+	log.Printf("collab peer_kicked room=%s host=%s target=%s notified=%d total=%d", client.roomID, client.id, targetID, delivered, total)
 }
 
 // sendError 发送结构化错误，前端可以直接展示为 toast/status。
