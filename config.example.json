@@ -1,0 +1,13 @@
+{
+  "addr": "127.0.0.1:8787",
+  "dbPath": "data/timenotes-collab.db",
+  "logPath": "logs/timenotes-collab.log",
+  "logMaxBytes": 5242880,
+  "secret": "replace-with-a-long-random-secret",
+  "corsOrigins": [
+    "http://127.0.0.1:9245",
+    "wails://wails.localhost"
+  ],
+  "allowLoopbackOrigins": true,
+  "maxMessageBytes": 67108864
+}
