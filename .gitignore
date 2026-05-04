@@ -1,0 +1,43 @@
+# Go build outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/dist/
+/build/
+
+# Test and coverage artifacts
+coverage.out
+coverage.html
+*.coverprofile
+
+# Local configuration and secrets
+.env
+.env.*
+config.json
+config.*.json
+!config.example.json
+
+# SQLite runtime data
+/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Logs and temporary runtime files
+/logs/
+*.log
+*.pid
+tmp/
+temp/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
