@@ -64,10 +64,17 @@ type CreateRoomRequest struct {
 // CreateRoomResponse 返回新房间的连接信息。
 // roomKey 是敏感值，前端只能用于当前连接和邀请链接，不应持久写入文档。
 type CreateRoomResponse struct {
-	RoomID    string `json:"roomId"`
-	RoomKey   string `json:"roomKey"`
-	WSURL     string `json:"wsUrl"`
-	InviteURL string `json:"inviteUrl"`
+	RoomID     string      `json:"roomId"`
+	RoomKey    string      `json:"roomKey"`
+	WSURL      string      `json:"wsUrl"`
+	InviteURL  string      `json:"inviteUrl"`
+	ICEServers []ICEServer `json:"iceServers,omitempty"`
+}
+
+// ICEServer 对齐浏览器 RTCIceServer 结构，供客户端直接传给 RTCPeerConnection。
+// 这里的 urls 只能是标准 stun:/turn: 地址；TimeNotes 应用层 relay 不属于这个列表。
+type ICEServer struct {
+	URLs []string `json:"urls"`
 }
 
 // Envelope 是所有 WebSocket/DataChannel 消息的外层协议。

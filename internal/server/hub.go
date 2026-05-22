@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -157,14 +158,17 @@ func (h *Hub) handleCreateRoom(c fiber.Ctx) error {
 	// roomKey 放在 fragment 中，正常 HTTP 请求和反向代理日志不会带 fragment。
 	serverBase := normalizeServerBase(req.ServerURL, requestBaseURL(c))
 	wsURL := buildWSURL(serverBase)
+	// iceServers 只广告标准 stun: URL；现有 WebSocket relay 是应用层中转，不能伪装成浏览器 TURN。
+	iceServers := []protocol.ICEServer{{URLs: []string{buildSTUNURL(serverBase)}}}
 	inviteURL := buildInviteURL(req.AppURL, serverBase, roomID, roomKey)
 	log.Printf("collab create_room ok room=%s remote=%s ws=%s", roomID, c.IP(), wsURL)
 
 	return c.Status(fiber.StatusCreated).JSON(protocol.CreateRoomResponse{
-		RoomID:    roomID,
-		RoomKey:   roomKey,
-		WSURL:     wsURL,
-		InviteURL: inviteURL,
+		RoomID:     roomID,
+		RoomKey:    roomKey,
+		WSURL:      wsURL,
+		InviteURL:  inviteURL,
+		ICEServers: iceServers,
 	})
 }
 
@@ -860,6 +864,24 @@ func buildWSURL(serverBase string) string {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String()
+}
+
+func buildSTUNURL(serverBase string) string {
+	// STUN 端口跟随对外服务地址：显式端口照用，https/wss 缺省为 443，http/ws 缺省为 80。
+	// 浏览器会用 UDP 访问该地址，部署时必须确保对应 UDP 端口能到达 StartSTUNServer。
+	parsed, err := url.Parse(serverBase)
+	if err != nil || parsed.Host == "" {
+		return "stun:127.0.0.1:8787"
+	}
+	port := parsed.Port()
+	if port == "" {
+		if parsed.Scheme == "https" || parsed.Scheme == "wss" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return "stun:" + net.JoinHostPort(parsed.Hostname(), port)
 }
 
 func buildInviteURL(appURL string, serverBase string, roomID string, roomKey string) string {

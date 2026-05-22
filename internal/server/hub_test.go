@@ -51,6 +51,9 @@ func TestCreateRoomAPI(t *testing.T) {
 	if payload.WSURL != "ws://10.0.0.2:8787/ws/collab" {
 		t.Fatalf("unexpected ws url: %s", payload.WSURL)
 	}
+	if len(payload.ICEServers) != 1 || len(payload.ICEServers[0].URLs) != 1 || payload.ICEServers[0].URLs[0] != "stun:10.0.0.2:8787" {
+		t.Fatalf("unexpected ice servers: %+v", payload.ICEServers)
+	}
 	if !strings.Contains(payload.InviteURL, "#") || !strings.Contains(payload.InviteURL, "roomId=") || !strings.Contains(payload.InviteURL, "roomKey=") {
 		t.Fatalf("invite url should carry room data in fragment: %s", payload.InviteURL)
 	}
@@ -60,6 +63,20 @@ func TestCreateRoomAPI(t *testing.T) {
 	beforeFragment := strings.SplitN(payload.InviteURL, "#", 2)[0]
 	if strings.Contains(beforeFragment, payload.RoomKey) {
 		t.Fatalf("room key must not be placed before URL fragment: %s", payload.InviteURL)
+	}
+}
+
+func TestBuildSTUNURL(t *testing.T) {
+	cases := map[string]string{
+		"http://10.0.0.2:8787": "stun:10.0.0.2:8787",
+		"https://example.com":  "stun:example.com:443",
+		"http://example.com":   "stun:example.com:80",
+		"http://[::1]:8787":    "stun:[::1]:8787",
+	}
+	for input, want := range cases {
+		if got := buildSTUNURL(input); got != want {
+			t.Fatalf("buildSTUNURL(%q)=%q, want %q", input, got, want)
+		}
 	}
 }
 

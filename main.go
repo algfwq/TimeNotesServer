@@ -63,7 +63,15 @@ func main() {
 	hub := server.NewHub(store, cfg.Secret, server.HubOptions{MaxMessageBytes: cfg.MaxMessageBytes})
 	hub.RegisterRoutes(app)
 
-	log.Printf("TimeNotes collaboration server config=%s addr=%s db=%s max_message_bytes=%d", cfg.ConfigPath, cfg.Addr, cfg.DBPath, cfg.MaxMessageBytes)
+	// 内置 STUN 跟随服务地址监听同一 host:port 的 UDP。
+	// 注意反向代理只转发 TCP 443 还不够，公网 P2P 需要把 UDP 443/8787 同样转发到本进程。
+	stunServer, err := server.StartSTUNServer(cfg.Addr)
+	if err != nil {
+		log.Fatalf("start stun server: %v", err)
+	}
+	defer stunServer.Close()
+
+	log.Printf("TimeNotes collaboration server config=%s addr=%s stun_udp=%s db=%s max_message_bytes=%d", cfg.ConfigPath, cfg.Addr, cfg.Addr, cfg.DBPath, cfg.MaxMessageBytes)
 	if err := app.Listen(cfg.Addr); err != nil {
 		log.Fatal(err)
 	}
