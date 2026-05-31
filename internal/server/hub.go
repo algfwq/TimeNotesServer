@@ -24,6 +24,8 @@ import (
 
 const defaultMaxMessageBytes = 64 * 1024 * 1024
 const joinApprovalTimeout = 60 * time.Second
+const clientSendQueueSize = 1024
+const reliableQueueTimeout = 5 * time.Second
 
 // HubOptions 是协作协调器的运行参数，由 JSON 配置文件传入。
 type HubOptions struct {
@@ -254,7 +256,7 @@ func (h *Hub) authenticate(conn *websocket.Conn) (*Client, storage.RoomState, er
 		return nil, storage.RoomState{}, errors.New("读取房间状态失败")
 	}
 
-	client := &Client{id: user.ID, roomID: roomID, user: user, conn: conn, send: make(chan protocol.Envelope, 64), hub: h}
+	client := &Client{id: user.ID, roomID: roomID, user: user, conn: conn, send: make(chan protocol.Envelope, clientSendQueueSize), hub: h}
 	return client, state, nil
 }
 
@@ -514,16 +516,31 @@ func (room *Room) sendTo(clientID string, env protocol.Envelope) bool {
 	return client.queue(env)
 }
 
-// queue 把消息放入单连接写队列；慢客户端队列满时丢弃并记录日志，避免阻塞整个房间。
+// queue 把消息放入单连接写队列；presence 这类临时状态允许丢弃，文档更新和文件中转必须可靠入队。
 func (client *Client) queue(env protocol.Envelope) bool {
 	select {
 	case client.send <- env:
 		return true
 	default:
-		// 不在这里阻塞等待，否则一个卡住的 WebSocket 会让整个房间广播链路变慢。
+	}
+	if isTransientEnvelope(env) {
+		// presence/高频临时状态可以丢弃；文件分块不能走这条路径，否则对端会永久卡在下载中。
 		log.Printf("collab drop_slow_client room=%s client=%s type=%s", client.roomID, client.id, env.Type)
 		return false
 	}
+	timer := time.NewTimer(reliableQueueTimeout)
+	defer timer.Stop()
+	select {
+	case client.send <- env:
+		return true
+	case <-timer.C:
+		log.Printf("collab drop_blocked_client room=%s client=%s type=%s", client.roomID, client.id, env.Type)
+		return false
+	}
+}
+
+func isTransientEnvelope(env protocol.Envelope) bool {
+	return env.Type == protocol.TypePresence
 }
 
 // writeLoop 串行写 WebSocket，所有外部发送都必须先进入 client.send。
