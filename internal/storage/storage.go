@@ -28,6 +28,8 @@ type Store interface {
 	SaveSnapshot(ctx context.Context, roomID string, state []byte) error
 	// CloseRoom 标记房间关闭。关闭后的房间不允许旧 roomKey 再次加入。
 	CloseRoom(ctx context.Context, roomID string) error
+	// UpdateCount 返回指定房间的增量 update 条数，用于触发自动 compact。
+	UpdateCount(ctx context.Context, roomID string) (int, error)
 }
 
 // RoomState 是后加入者恢复文档所需的最小状态集合。

@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/cors"
@@ -72,9 +76,24 @@ func main() {
 	defer stunServer.Close()
 
 	log.Printf("TimeNotes collaboration server config=%s addr=%s stun_udp=%s db=%s max_message_bytes=%d", cfg.ConfigPath, cfg.Addr, cfg.Addr, cfg.DBPath, cfg.MaxMessageBytes)
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-quit
+		log.Println("collab shutting down gracefully...")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = stunServer.Close()
+		if err := app.ShutdownWithContext(ctx); err != nil {
+			log.Printf("collab shutdown error: %v", err)
+		}
+	}()
+
 	if err := app.Listen(cfg.Addr); err != nil {
 		log.Fatal(err)
 	}
+	log.Println("collab server stopped")
 }
 
 func configureLogging(logPath string, maxBytes int64) (*os.File, error) {
