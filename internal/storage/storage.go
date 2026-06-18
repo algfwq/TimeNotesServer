@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // ErrRoomKeyMismatch 表示 roomId 存在但 roomKey 的 HMAC 不匹配。
@@ -30,6 +31,10 @@ type Store interface {
 	CloseRoom(ctx context.Context, roomID string) error
 	// UpdateCount 返回指定房间的增量 update 条数，用于触发自动 compact。
 	UpdateCount(ctx context.Context, roomID string) (int, error)
+	// RoomStorageBytes 计算单房间当前累计存储字节数（compact_state + 所有 update_blob 长度）。
+	RoomStorageBytes(ctx context.Context, roomID string) (int64, error)
+	// DeleteInactiveRooms 删除 updated_at 早于 cutoff 的已关闭房间及其关联数据，返回删除行数。
+	DeleteInactiveRooms(ctx context.Context, cutoff time.Time) (int, error)
 }
 
 // RoomState 是后加入者恢复文档所需的最小状态集合。

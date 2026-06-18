@@ -27,7 +27,7 @@ func main() {
 	}
 	// configureLogging 必须最先执行：
 	// 后续初始化数据库、创建路由、启动监听的错误都需要落到同一个日志文件中，
-	// 这样用户反馈“无法加入房间”“聊天没收到”时，可以先看一次启动日志和连接日志。
+	// 这样用户反馈"无法加入房间""聊天没收到"时，可以先看一次启动日志和连接日志。
 	logFile, err := configureLogging(cfg.LogPath, cfg.LogMaxBytes)
 	if err != nil {
 		log.Fatalf("configure logging: %v", err)
@@ -46,26 +46,49 @@ func main() {
 	}
 	defer store.Close()
 
-	app := fiber.New(fiber.Config{AppName: "TimeNotes Collaboration Server"})
+	app := fiber.New(fiber.Config{
+		AppName:     "TimeNotes Collaboration Server",
+		ReadTimeout: 10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout: 30 * time.Second,
+	})
+	// CORS 与 WebSocket Origin 校验共享同一份 allowOrigin 闭包，保证策略一致。
+	allowOriginFn := func(origin string) bool {
+		return allowOrigin(origin, cfg.CORSOrigins, cfg.AllowLoopbackOrigins)
+	}
 	// 前端开发端口 9245 会跨源调用 /api/rooms 创建房间，因此需要 CORS。
 	// 默认动态放行 loopback 与 Wails WebView origin；LAN/反代部署可用 TIMENOTES_CORS_ORIGINS 追加精确 origin。
 	// 生产环境不要依赖默认放行逻辑，应显式配置应用域名，例如：
 	// "corsOrigins": ["https://notes.example.com", "timenotes://collab"]
 	app.Use(cors.New(cors.Config{
-		AllowOriginsFunc: func(origin string) bool {
-			return allowOrigin(origin, cfg.CORSOrigins, cfg.AllowLoopbackOrigins)
-		},
+		AllowOriginsFunc: allowOriginFn,
 		AllowMethods: []string{
 			fiber.MethodGet,
 			fiber.MethodPost,
 			fiber.MethodOptions,
 		},
-		AllowHeaders: []string{"Content-Type"},
+		AllowHeaders: []string{"Content-Type", "Upgrade", "Connection"},
 	}))
 	// Hub 持有房间内存状态和所有 WebSocket 连接；HTTP 路由本身保持薄层，
 	// 这样 Fiber 可替换、存储可替换，而协作协议只集中在 internal/server。
-	hub := server.NewHub(store, cfg.Secret, server.HubOptions{MaxMessageBytes: cfg.MaxMessageBytes})
-	hub.RegisterRoutes(app)
+	hub := server.NewHub(store, cfg.Secret, server.HubOptions{
+		MaxMessageBytes:        cfg.MaxMessageBytes,
+		MaxUpdateBytes:         cfg.MaxUpdateBytes,
+		MaxSnapshotBytes:       cfg.MaxSnapshotBytes,
+		RoomMaxStorageBytes:    cfg.RoomMaxStorageBytes,
+		AuthTimeout:            cfg.AuthTimeout,
+		ReadDeadline:           cfg.ReadDeadline,
+		RoomTTLDays:            cfg.RoomTTLDays,
+		CleanupInterval:        cfg.CleanupInterval,
+		MaxRoomsPerIPPerMinute:  cfg.MaxRoomsPerIPPerMinute,
+		MaxWSConnPerIPPerMinute: cfg.MaxWSConnPerIPPerMinute,
+		AllowedServerHosts:     cfg.AllowedServerHosts,
+		TrustedProxies:         cfg.TrustedProxies,
+	})
+	hub.RegisterRoutes(app, allowOriginFn)
+
+	// 启动后台房间清理 goroutine：删除过期关闭房间 + 清理限流器缓存。
+	hub.StartCleanup(context.Background())
 
 	// 内置 STUN 跟随服务地址监听同一 host:port 的 UDP。
 	// 注意反向代理只转发 TCP 443 还不够，公网 P2P 需要把 UDP 443/8787 同样转发到本进程。
@@ -75,7 +98,7 @@ func main() {
 	}
 	defer stunServer.Close()
 
-	log.Printf("TimeNotes collaboration server config=%s addr=%s stun_udp=%s db=%s max_message_bytes=%d", cfg.ConfigPath, cfg.Addr, cfg.Addr, cfg.DBPath, cfg.MaxMessageBytes)
+	log.Printf("TimeNotes collaboration server config=%s addr=%s stun_udp=%s db=%s max_message=%d max_update=%d max_snapshot=%d room_max_storage=%d ttl_days=%d", cfg.ConfigPath, cfg.Addr, cfg.Addr, cfg.DBPath, cfg.MaxMessageBytes, cfg.MaxUpdateBytes, cfg.MaxSnapshotBytes, cfg.RoomMaxStorageBytes, cfg.RoomTTLDays)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

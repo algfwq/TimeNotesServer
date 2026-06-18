@@ -9,5 +9,15 @@
     "wails://wails.localhost"
   ],
   "allowLoopbackOrigins": true,
-  "maxMessageBytes": 67108864
+  "maxMessageBytes": 134217728,
+  "maxUpdateBytes": 8388608,
+  "maxSnapshotBytes": 67108864,
+  "roomMaxStorageBytes": 536870912,
+  "authTimeout": "15s",
+  "readDeadline": "30s",
+  "roomTTLDays": 30,
+  "cleanupInterval": "1h",
+  "maxRoomsPerIPPerMinute": 10,
+  "allowedServerHosts": [],
+  "insecureAllowDefaultSecret": false
 }

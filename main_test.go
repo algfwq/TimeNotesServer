@@ -36,15 +36,15 @@ func TestAllowOriginWithoutLoopback(t *testing.T) {
 func TestLoadConfigFromJSON(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "server.json")
 	body := []byte(`{
-  "addr": "0.0.0.0:9000",
-  "dbPath": "data/test.db",
-  "logPath": "logs/test.log",
-  "logMaxBytes": 2048,
-  "secret": "json-secret",
-  "corsOrigins": ["https://notes.example.com"],
-  "allowLoopbackOrigins": false,
-  "maxMessageBytes": 4096
-}`)
+	  "addr": "0.0.0.0:9000",
+	  "dbPath": "data/test.db",
+	  "logPath": "logs/test.log",
+	  "logMaxBytes": 2048,
+	  "secret": "json-secret-with-min-16-chars",
+	  "corsOrigins": ["https://notes.example.com"],
+	  "allowLoopbackOrigins": false,
+	  "maxMessageBytes": 4096
+	}`)
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestLoadConfigFromJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Addr != "0.0.0.0:9000" || cfg.Secret != "json-secret" || cfg.AllowLoopbackOrigins {
+	if cfg.Addr != "0.0.0.0:9000" || cfg.Secret != "json-secret-with-min-16-chars" || cfg.AllowLoopbackOrigins {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	if len(cfg.CORSOrigins) != 1 || cfg.CORSOrigins[0] != "https://notes.example.com" {

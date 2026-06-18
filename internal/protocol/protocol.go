@@ -51,6 +51,15 @@ const (
 	TypeRoomClosed = "room_closed"
 	// TypeError 是结构化错误，前端可以直接映射为 toast 或状态栏文案。
 	TypeError = "error"
+	// TypeDocUpdateRejected 在 AppendUpdate 持久化失败时回压来源客户端，
+	// 客户端收到后应触发 Yjs 自愈重同步，避免 CRDT 历史分叉。
+	TypeDocUpdateRejected = "doc_update_rejected"
+	// TypeCompactionRequest 由服务端发给房主，提示当前 room_updates 条数过多，
+	// 房主应合并生成新的 Yjs snapshot 并通过 doc_snapshot 上传，让服务端清空历史增量。
+	TypeCompactionRequest = "compaction_request"
+	// TypeHostChanged 在房主非正常退出且存在可迁移的协作者时广播，
+	// 客户端据此更新本地的 hostId 缓存与权限判定。
+	TypeHostChanged = "host_changed"
 )
 
 // CreateRoomRequest 是“发起联机”按钮调用的 HTTP 请求体。
@@ -244,6 +253,26 @@ type PongPayload struct {
 type ErrorPayload struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// DocUpdateRejectedPayload 是服务端持久化失败时回压客户端的提示。
+// UpdateID 与客户端原发送的 DocUpdatePayload.UpdateID 对齐，便于客户端定位丢失的更新。
+type DocUpdateRejectedPayload struct {
+	UpdateID string `json:"updateId"`
+	Reason   string `json:"reason"`
+}
+
+// CompactionRequestPayload 提示房主触发 Yjs snapshot 合并。
+// UpdateCount 是当前未压缩的增量数，仅供 UI 展示，房主不需要回填。
+type CompactionRequestPayload struct {
+	RoomID      string `json:"roomId,omitempty"`
+	UpdateCount int    `json:"updateCount"`
+}
+
+// HostChangedPayload 在房主迁移时广播，所有客户端必须更新本地 hostId。
+type HostChangedPayload struct {
+	NewHostID string `json:"newHostId"`
+	OldHostID string `json:"oldHostId,omitempty"`
 }
 
 // NewEnvelope 创建服务端发送或测试中使用的标准 envelope。

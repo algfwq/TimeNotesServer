@@ -26,7 +26,7 @@ func TestCreateRoomAPI(t *testing.T) {
 	defer store.Close()
 
 	app := fiber.New()
-	NewHub(store, "test-secret").RegisterRoutes(app)
+	NewHub(store, "test-secret").RegisterRoutes(app, func(string) bool { return true })
 
 	body := strings.NewReader(`{"serverUrl":"http://10.0.0.2:8787","appUrl":"http://127.0.0.1:9245/"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/rooms", body)
@@ -106,7 +106,7 @@ func TestHostLeaveClosesRoom(t *testing.T) {
 		t.Fatalf("ensure room: %v", err)
 	}
 
-	host := &Client{id: "host", roomID: roomID, user: protocol.User{ID: "host", Name: "房主"}, send: make(chan protocol.Envelope, 4), hub: hub}
+	host := &Client{id: "host", roomID: roomID, user: protocol.User{ID: "host", Name: "房主"}, send: make(chan protocol.Envelope, 16), hub: hub}
 	room, joined := hub.joinRoom(host, storage.RoomState{})
 	if !joined {
 		t.Fatalf("host should join immediately")
@@ -114,7 +114,7 @@ func TestHostLeaveClosesRoom(t *testing.T) {
 	if host.user.Role != "host" || room.hostID != host.id {
 		t.Fatalf("first client should become host, role=%s host=%s", host.user.Role, room.hostID)
 	}
-	guest := &Client{id: "guest", roomID: roomID, user: protocol.User{ID: "guest", Name: "协作者"}, send: make(chan protocol.Envelope, 4), hub: hub}
+	guest := &Client{id: "guest", roomID: roomID, user: protocol.User{ID: "guest", Name: "协作者"}, send: make(chan protocol.Envelope, 16), hub: hub}
 	if !joinApproved(t, hub, guest, room) {
 		t.Fatalf("guest should join after approval")
 	}
@@ -122,19 +122,59 @@ func TestHostLeaveClosesRoom(t *testing.T) {
 		t.Fatalf("second client should become collaborator, got %s", guest.user.Role)
 	}
 
+	// 房主退出时若仍有协作者，应触发房主迁移而非关闭房间。
 	hub.leaveRoom(room, host)
-	foundClosed := false
-	for env := range guest.send {
-		if env.Type == protocol.TypeRoomClosed {
-			foundClosed = true
-			break
+	foundHostChanged := false
+	timeout := time.After(2 * time.Second)
+loop:
+	for {
+		select {
+		case env, ok := <-guest.send:
+			if !ok {
+				break loop
+			}
+			if env.Type == protocol.TypeHostChanged {
+				foundHostChanged = true
+			}
+		case <-timeout:
+			break loop
 		}
 	}
-	if !foundClosed {
-		t.Fatalf("guest should receive room_closed before channel closes")
+	guest.shutdown()
+	if !foundHostChanged {
+		t.Fatalf("guest should receive host_changed after host migration")
 	}
+	if guest.user.Role != "host" {
+		t.Fatalf("guest should become host after migration, got %s", guest.user.Role)
+	}
+	// 房间应仍可加入。
+	if err := store.EnsureRoom(context.Background(), roomID, keyHash); err != nil {
+		t.Fatalf("room should remain open after migration, got %v", err)
+	}
+}
+
+func TestHostLeaveClosesRoomWhenAlone(t *testing.T) {
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "collab.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	hub := NewHub(store, "test-secret")
+	roomID := "room-close-alone"
+	keyHash := hub.roomKeyHash(roomID, "room-key")
+	if err := store.EnsureRoom(context.Background(), roomID, keyHash); err != nil {
+		t.Fatalf("ensure room: %v", err)
+	}
+
+	host := &Client{id: "host", roomID: roomID, user: protocol.User{ID: "host", Name: "房主"}, send: make(chan protocol.Envelope, 4), hub: hub}
+	room, joined := hub.joinRoom(host, storage.RoomState{})
+	if !joined {
+		t.Fatalf("host should join")
+	}
+	// 没有协作者时房主离开，房间应关闭。
+	hub.leaveRoom(room, host)
 	if err := store.EnsureRoom(context.Background(), roomID, keyHash); !errors.Is(err, storage.ErrRoomClosed) {
-		t.Fatalf("closed room should reject future joins, got %v", err)
+		t.Fatalf("room should be closed when host leaves alone, got %v", err)
 	}
 }
 

@@ -25,13 +25,13 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	dsn := path + "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_cache_size=-16000"
+	dsn := path + "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_cache_size=-16000&_txlock=immediate&_foreign_keys=on"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(2)
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	store := &Store{db: db}
 	if err := store.migrate(context.Background()); err != nil {
@@ -204,4 +204,33 @@ func (s *Store) UpdateCount(ctx context.Context, roomID string) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM room_updates WHERE room_id = ?`, roomID).Scan(&count)
 	return count, err
+}
+
+func (s *Store) RoomStorageBytes(ctx context.Context, roomID string) (int64, error) {
+	var total int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(LENGTH(compact_state),0) + COALESCE((SELECT SUM(LENGTH(update_blob)) FROM room_updates WHERE room_id = ?),0)`, roomID).Scan(&total)
+	return total, err
+}
+
+func (s *Store) DeleteInactiveRooms(ctx context.Context, cutoff time.Time) (int, error) {
+	cutoffStr := cutoff.UTC().Format(time.RFC3339Nano)
+	// 显式删除关联的 room_updates 行；即使 _foreign_keys 已启用，也避免依赖级联以兼容历史部署。
+	// 先删子表再删父表，按 updated_at 早于 cutoff 的已关闭房间过滤。
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM room_updates WHERE room_id IN (SELECT room_id FROM rooms WHERE closed_at IS NOT NULL AND updated_at < ?)`, cutoffStr); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM rooms WHERE closed_at IS NOT NULL AND updated_at < ?`, cutoffStr)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
 }

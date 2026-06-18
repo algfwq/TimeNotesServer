@@ -5,6 +5,11 @@ import (
 	"errors"
 	"log"
 	"net"
+	"runtime"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -17,12 +22,24 @@ const (
 	stunAttrXORMappedAddress = 0x0020
 	// magic cookie 用于区分新版 STUN 报文，并参与 XOR 地址混淆。
 	stunMagicCookie = 0x2112A442
+	// stunRateLimit 限制单 IP 每秒 STUN 请求数，防止被用作 DDoS 反射器。
+	stunRateLimit      = 20
+	stunRateBurst      = 10
+	stunLimiterTTL     = 5 * time.Minute
 )
 
 // STUNServer 是内置的最小 RFC 5389 Binding 服务。
-// 它只告诉浏览器“服务端看到你的 UDP 来源 IP/端口是什么”，不记录房间密钥、不处理业务数据，也不承担 TURN relay。
+// 它只告诉浏览器"服务端看到你的 UDP 来源 IP/端口是什么"，不记录房间密钥、不处理业务数据，也不承担 TURN relay。
 type STUNServer struct {
-	conn net.PacketConn
+	conn      net.PacketConn
+	done      chan struct{}
+	limiterMu sync.Mutex
+	limiters  map[string]*stunLimiter
+}
+
+type stunLimiter struct {
+	limiter *rate.Limiter
+	lastUse time.Time
 }
 
 // StartSTUNServer 在与 HTTP/WS 相同的 addr 上启动 UDP STUN 监听。
@@ -32,18 +49,49 @@ func StartSTUNServer(addr string) (*STUNServer, error) {
 	if err != nil {
 		return nil, err
 	}
-	server := &STUNServer{conn: conn}
-	go server.serve()
-	log.Printf("stun listening udp=%s", conn.LocalAddr())
+	server := &STUNServer{conn: conn, done: make(chan struct{}), limiters: make(map[string]*stunLimiter)}
+	// 多 worker 共享同一个 PacketConn，利用多核并行处理 STUN 请求。
+	workers := runtime.NumCPU()
+	if workers < 2 {
+		workers = 2
+	}
+	for i := 0; i < workers; i++ {
+		go server.serve()
+	}
+	// 定期清理过期的限流器。
+	go server.cleanupLoop()
+	log.Printf("stun listening udp=%s workers=%d", conn.LocalAddr(), workers)
 	return server, nil
 }
 
-// Close 关闭 UDP 监听；serve 循环会收到 net.ErrClosed 后自然退出。
+// Close 关闭 UDP 监听和限流器清理 goroutine；serve 循环会收到 net.ErrClosed 后自然退出。
 func (s *STUNServer) Close() error {
+	close(s.done)
 	return s.conn.Close()
 }
 
-// serve 是单 goroutine UDP 循环。STUN 请求很小，固定 1500 字节缓冲足以覆盖普通 MTU 内的 Binding Request。
+// cleanupLoop 定期清理超过 TTL 未使用的 IP 限流器，防止内存泄漏。
+func (s *STUNServer) cleanupLoop() {
+	ticker := time.NewTicker(stunLimiterTTL)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.limiterMu.Lock()
+			now := time.Now()
+			for ip, lim := range s.limiters {
+				if now.Sub(lim.lastUse) > stunLimiterTTL {
+					delete(s.limiters, ip)
+				}
+			}
+			s.limiterMu.Unlock()
+		}
+	}
+}
+
+// serve 是 UDP 处理循环。STUN 请求很小，固定 1500 字节缓冲足以覆盖普通 MTU 内的 Binding Request。
 func (s *STUNServer) serve() {
 	buf := make([]byte, 1500)
 	for {
@@ -54,6 +102,12 @@ func (s *STUNServer) serve() {
 			}
 			return
 		}
+		// IP 维度速率限制，防止被用作 DDoS 反射器。
+		ip := remoteAddrIP(remote)
+		if !s.allow(ip) {
+			log.Printf("stun rate_limited remote=%s", ip)
+			continue
+		}
 		// 非 STUN、非 Binding Request 或格式不完整的 UDP 包直接忽略，不返回业务错误。
 		response, ok := buildSTUNBindingResponse(buf[:n], remote)
 		if !ok {
@@ -62,6 +116,32 @@ func (s *STUNServer) serve() {
 		if _, err := s.conn.WriteTo(response, remote); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Printf("stun write failed remote=%s err=%v", remote, err)
 		}
+	}
+}
+
+func (s *STUNServer) allow(ip string) bool {
+	s.limiterMu.Lock()
+	lim, ok := s.limiters[ip]
+	if !ok {
+		lim = &stunLimiter{limiter: rate.NewLimiter(rate.Limit(stunRateLimit), stunRateBurst)}
+		s.limiters[ip] = lim
+	}
+	lim.lastUse = time.Now()
+	s.limiterMu.Unlock()
+	return lim.limiter.Allow()
+}
+
+func remoteAddrIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		return a.IP.String()
+	case *net.TCPAddr:
+		return a.IP.String()
+	default:
+		return addr.String()
 	}
 }
 
