@@ -55,12 +55,22 @@ func (s *Store) migrate(ctx context.Context) error {
 		if entry.IsDir() {
 			continue
 		}
-		body, err := migrations.Files.ReadFile(entry.Name())
+		name := entry.Name()
+		// 跳过已应用的迁移，确保每份 SQL 文件只执行一次。
+		var already string
+		if err := s.db.QueryRowContext(ctx, `SELECT filename FROM migration_versions WHERE filename = ?`, name).Scan(&already); err == nil {
+			continue
+		}
+		body, err := migrations.Files.ReadFile(name)
 		if err != nil {
 			return err
 		}
 		if _, err := s.db.ExecContext(ctx, string(body)); err != nil {
-			return fmt.Errorf("apply migration %s: %w", entry.Name(), err)
+			return fmt.Errorf("apply migration %s: %w", name, err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO migration_versions(filename, applied_at) VALUES(?, ?)`,
+			name, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record migration %s: %w", name, err)
 		}
 	}
 	return s.ensureClosedAtColumn(ctx)

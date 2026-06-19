@@ -1,3 +1,9 @@
+-- migration_versions 记录已应用的迁移文件，防止重复执行。
+CREATE TABLE IF NOT EXISTS migration_versions (
+  filename TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
+);
+
 -- rooms 保存房间级元数据和 compact_state。
 -- key_hash 是 roomId + roomKey + 服务端 secret 的 HMAC，数据库不保存 roomKey 原文。
 CREATE TABLE IF NOT EXISTS rooms (

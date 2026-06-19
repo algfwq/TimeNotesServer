@@ -39,6 +39,7 @@ temp/
 # Editor and OS files
 .DS_Store
 Thumbs.db
+nul
 .idea/
 .vscode/
 .qwen/
