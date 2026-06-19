@@ -60,6 +60,12 @@ const (
 	// TypeHostChanged 在房主非正常退出且存在可迁移的协作者时广播，
 	// 客户端据此更新本地的 hostId 缓存与权限判定。
 	TypeHostChanged = "host_changed"
+	// TypeVoiceSignal 是语音通话的媒体信令（offer/answer/ICE），独立于数据通道信令。
+	TypeVoiceSignal = "voice_signal"
+	// TypeVoiceData 承载语音数据分片，走 voice DataChannel P2P 或 WebSocket relay。
+	TypeVoiceData = "voice_data"
+	// TypeVoiceCtrl 是语音控制消息（关麦通知等）。
+	TypeVoiceCtrl = "voice_ctrl"
 )
 
 // CreateRoomRequest 是“发起联机”按钮调用的 HTTP 请求体。
@@ -273,6 +279,20 @@ type CompactionRequestPayload struct {
 type HostChangedPayload struct {
 	NewHostID string `json:"newHostId"`
 	OldHostID string `json:"oldHostId,omitempty"`
+}
+
+// VoiceSignalPayload 是语音通话的媒体 WebRTC 信令。
+// 与 TypeSignal 区分开，避免数据通道和音频通道的信令相互干扰。
+type VoiceSignalPayload struct {
+	Kind      string          `json:"kind"`
+	Candidate json.RawMessage `json:"candidate,omitempty"`
+	SDP       string          `json:"sdp,omitempty"`
+}
+
+// VoiceDataPayload 承载语音数据分片。
+// ChunkBase64 是原始音频数据的 base64 编码。
+type VoiceDataPayload struct {
+	ChunkBase64 string `json:"chunkBase64,omitempty"`
 }
 
 // NewEnvelope 创建服务端发送或测试中使用的标准 envelope。

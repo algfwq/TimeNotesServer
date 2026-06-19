@@ -1034,18 +1034,25 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 			env.Payload = raw
 		}
 		room.broadcast(env, client.id)
-	case protocol.TypeSignal:
-		_, err := protocol.DecodePayload[protocol.SignalPayload](env)
-		if err != nil {
-			client.sendError("bad_signal", "信令格式无效")
-			return
-		}
-		// 信令优先点对点投递（To 非空时），fallback 广播；offer 通常不设置 To。
-		if env.To != "" {
-			room.sendTo(env.To, env)
-		} else {
-			room.broadcast(env, client.id)
-		}
+		case protocol.TypeSignal:
+			signal, err := protocol.DecodePayload[protocol.SignalPayload](env)
+			if err != nil || (signal.Kind == "" && signal.SDP == "" && len(signal.Candidate) == 0) {
+				client.sendError("bad_signal", "信令格式无效")
+				return
+			}
+			// 信令优先点对点投递（To 非空时），fallback 广播；offer 通常不设置 To。
+			if env.To != "" {
+				room.sendTo(env.To, env)
+			} else {
+				room.broadcast(env, client.id)
+			}
+		case protocol.TypeVoiceSignal:
+			// 语音媒体信令：按 To 点对点转发（offer/answer）/ 广播（ICE candidate）。
+			if env.To != "" {
+				room.sendTo(env.To, env)
+			} else {
+				room.broadcast(env, client.id)
+			}
 	case protocol.TypeRelay:
 		inner := env.Payload
 		var relay protocol.RelayPayload
@@ -1053,8 +1060,8 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 			client.sendError("bad_relay", "中转消息格式无效")
 			return
 		}
-		switch relay.Type {
-			case protocol.TypeDocUpdate, protocol.TypeChat:
+			switch relay.Type {
+			case protocol.TypeDocUpdate, protocol.TypeChat, protocol.TypeVoiceData, protocol.TypeVoiceCtrl:
 				delivered := room.broadcast(env, client.id)
 				log.Printf("collab relay type=%s room=%s client=%s delivered=%d", relay.Type, client.roomID, client.id, delivered)
 			case protocol.TypeSignal:
@@ -1130,8 +1137,12 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 		room.mu.Unlock()
 		delivered := room.broadcast(protocol.NewEnvelope(protocol.TypePeerLeft, "server", "", fiber.Map{"clientId": payload.ClientID}), "")
 		log.Printf("collab kicked room=%s target=%s by=%s reason=%s delivered=%d", client.roomID, payload.ClientID, client.id, payload.Reason, delivered)
-	default:
-		client.sendError("unknown_type", "未知消息类型")
+		case protocol.TypeVoiceData:
+			// voice_data 仅通过 relay 中转到达，直接消息不做处理。
+		case protocol.TypeVoiceCtrl:
+			// voice_ctrl 仅通过 relay 中转到达，直接消息不做处理。
+		default:
+			client.sendError("unknown_type", "未知消息类型")
 	}
 }
 
