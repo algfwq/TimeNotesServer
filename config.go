@@ -49,6 +49,10 @@ type AppConfig struct {
 	MaxRoomsPerIPPerMinute int `json:"maxRoomsPerIPPerMinute"`
 	// MaxWSConnPerIPPerMinute 限制单 IP WebSocket 连接频率，防止连接耗尽和通过 WS 路径批量创建房间。
 	MaxWSConnPerIPPerMinute int `json:"maxWSConnPerIPPerMinute"`
+	// MaxClientsPerRoom 限制单个房间的最大在线成员数（含房主），防止单房间消耗过多内存和 goroutine。
+	MaxClientsPerRoom int `json:"maxClientsPerRoom"`
+	// MaxGlobalRooms 限制全局同时在线房间数上限；0 表示不限制。
+	MaxGlobalRooms int `json:"maxGlobalRooms"`
 	// AllowedServerHosts 限制 handleCreateRoom 接受的 serverUrl host 白名单；空表示只校验格式。
 	AllowedServerHosts []string `json:"allowedServerHosts"`
 	// TrustedProxies 是反向代理 IP/CIDR 白名单；只有来自受信任代理的 X-Forwarded-For 才会被信任。
@@ -109,6 +113,8 @@ func defaultConfig() AppConfig {
 		CleanupInterval:          time.Hour,
 		MaxRoomsPerIPPerMinute:   10,
 		MaxWSConnPerIPPerMinute:  30,
+		MaxClientsPerRoom:        20,
+		MaxGlobalRooms:           0,
 		InsecureAllowDefaultSecret: false,
 	}
 }
@@ -177,6 +183,16 @@ func applyEnvOverrides(cfg *AppConfig) {
 			cfg.InsecureAllowDefaultSecret = parsed
 		}
 	}
+	if value := strings.TrimSpace(os.Getenv("TIMENOTES_MAX_CLIENTS_PER_ROOM")); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			cfg.MaxClientsPerRoom = parsed
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("TIMENOTES_MAX_GLOBAL_ROOMS")); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			cfg.MaxGlobalRooms = parsed
+		}
+	}
 }
 
 // validateConfig 只做启动必须的硬约束；端口占用、数据库权限等留给后续实际初始化返回具体错误。
@@ -222,6 +238,12 @@ func validateConfig(cfg AppConfig) error {
 	}
 	if cfg.MaxWSConnPerIPPerMinute < 1 {
 		return fmt.Errorf("config maxWSConnPerIPPerMinute must be >= 1")
+	}
+	if cfg.MaxClientsPerRoom < 0 {
+		return fmt.Errorf("config maxClientsPerRoom must be >= 0")
+	}
+	if cfg.MaxGlobalRooms < 0 {
+		return fmt.Errorf("config maxGlobalRooms must be >= 0")
 	}
 	// 生产安全约束：监听非 loopback 地址时禁止使用默认/空 secret，避免任何人下载源码即可伪造 roomKey。
 	// 本机开发（127.0.0.1 / ::1）或显式豁免标志可跳过。

@@ -215,8 +215,11 @@ type DocUpdatePayload struct {
 }
 
 // DocSnapshotPayload 保存 Yjs 全量状态；服务端不解析其内部结构。
+// BaseSeq 是快照覆盖的最大 update seq，服务端只删除 seq <= BaseSeq 的增量，
+// 避免快照生成期间其他客户端新 append 的高 seq 增量丢失。
 type DocSnapshotPayload struct {
 	StateBase64 string `json:"stateBase64"`
+	BaseSeq     int64  `json:"baseSeq,omitempty"`
 }
 
 // PresencePayload 是高频在线状态；relay=false 时通常只用于服务端保存最新快照，不广播。

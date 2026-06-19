@@ -52,6 +52,10 @@ type HubOptions struct {
 	MaxWSConnPerIPPerMinute int
 	AllowedServerHosts []string
 	TrustedProxies     []string
+	// MaxClientsPerRoom 限制单个房间的最大在线成员数。默认 20，设为 0 表示不限制。
+	MaxClientsPerRoom  int
+	// MaxGlobalRooms 限制全局同时在线房间数。默认 0 表示不限制。
+	MaxGlobalRooms     int
 }
 
 type ipLimiter struct {
@@ -77,6 +81,8 @@ type Hub struct {
 	allowedServerHosts []string
 	trustedProxies     []string
 	startTime          time.Time
+	maxClientsPerRoom  int
+	maxGlobalRooms     int
 	// roomSerializers 确保同一房间内的所有数据库写入串行化，避免 SQLite 并发写入冲突。
 	roomSerializers map[string]chan struct{}
 	roomSerialMu    sync.Mutex
@@ -123,6 +129,8 @@ type Client struct {
 	id         string
 	roomID     string
 	user       protocol.User
+	// userMu 保护 user 字段，presence handler 无 room.mu 写入时不会与 peersLocked/joinRoom 读产生数据竞争。
+	userMu     sync.RWMutex
 	conn       *websocket.Conn
 	send       chan protocol.Envelope
 	hub        *Hub
@@ -132,6 +140,9 @@ type Client struct {
 	closed    atomic.Bool
 	// JoinedAt 是客户端成功加入房间的时间戳，用于房主迁移选举。
 	JoinedAt time.Time
+	// ctx 随客户端生命周期取消；当 readLoop 退出时 cancel，goroutine 中的 store 调用可快速退出。
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func NewHub(store storage.Store, secret string, options ...HubOptions) *Hub {
@@ -151,6 +162,8 @@ func NewHub(store storage.Store, secret string, options ...HubOptions) *Hub {
 	maxWSConnPerIP := 30
 	var allowedHosts []string
 	var trustedProxies []string
+	maxClients := 20
+	maxGlobal := 0
 	if len(options) > 0 {
 		opt := options[0]
 		if opt.MaxMessageBytes > 0 {
@@ -183,6 +196,12 @@ func NewHub(store storage.Store, secret string, options ...HubOptions) *Hub {
 		if opt.MaxWSConnPerIPPerMinute > 0 {
 			maxWSConnPerIP = opt.MaxWSConnPerIPPerMinute
 		}
+		if opt.MaxClientsPerRoom > 0 {
+			maxClients = opt.MaxClientsPerRoom
+		}
+		if opt.MaxGlobalRooms > 0 {
+			maxGlobal = opt.MaxGlobalRooms
+		}
 		allowedHosts = opt.AllowedServerHosts
 		trustedProxies = opt.TrustedProxies
 	}
@@ -203,6 +222,8 @@ func NewHub(store storage.Store, secret string, options ...HubOptions) *Hub {
 		allowedServerHosts:   allowedHosts,
 		trustedProxies:       trustedProxies,
 		startTime:            time.Now(),
+		maxClientsPerRoom:    maxClients,
+		maxGlobalRooms:       maxGlobal,
 		roomSerializers:      make(map[string]chan struct{}),
 		createRoomLimiters:   make(map[string]*ipLimiter),
 		wsConnLimiters:       make(map[string]*ipLimiter),
@@ -410,8 +431,10 @@ func (h *Hub) checkIPRateLimit(ip string, maxPerMinute int, mu *sync.Mutex, limi
 	return lim.limiter.Allow()
 }
 
-// clientIP 提取客户端真实 IP。优先从 X-Forwarded-For 取首个 IP（反向代理场景），
+// clientIP 提取客户端真实 IP。优先从 X-Forwarded-For 取真实 IP（反向代理场景），
 // 但仅当请求来自受信任代理时才信任 XFF 头；否则回退到 TCP 对端地址。
+// 从右往左扫描 XFF 列表，跳过受信任代理，取第一个非受信任 IP 作为真实客户端地址，
+// 防止攻击者伪造最左值绕过 IP 维度限流。
 func (h *Hub) clientIP(c fiber.Ctx) string {
 	remoteIP := net.ParseIP(strings.TrimSpace(c.IP()))
 	if remoteIP == nil {
@@ -419,13 +442,21 @@ func (h *Hub) clientIP(c fiber.Ctx) string {
 	}
 	if h.isTrustedProxy(remoteIP) {
 		if xff := strings.TrimSpace(c.Get("X-Forwarded-For")); xff != "" {
-			// XFF 可能是逗号分隔列表 "client, proxy1, proxy2"，取最左侧。
-			if idx := strings.Index(xff, ","); idx >= 0 {
-				xff = xff[:idx]
-			}
-			xff = strings.TrimSpace(xff)
-			if xff != "" {
-				return xff
+			// XFF 是逗号分隔列表 "client, proxy1, ..., last-proxy"。
+			// 从右往左扫描，跳过受信任代理，取第一个非受信任 IP。
+			parts := strings.Split(xff, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				ipStr := strings.TrimSpace(parts[i])
+				if ipStr == "" {
+					continue
+				}
+				ip := net.ParseIP(ipStr)
+				if ip == nil {
+					continue
+				}
+				if !h.isTrustedProxy(ip) {
+					return ipStr
+				}
 			}
 		}
 	}
@@ -456,9 +487,8 @@ func (h *Hub) isTrustedProxy(ip net.IP) bool {
 
 func (h *Hub) handleSocket(conn *websocket.Conn) {
 	defer conn.Close()
-	if h.maxMessageBytes > 0 {
-		conn.SetReadLimit(h.maxMessageBytes)
-	}
+	// 认证阶段限制读大小 64KB，防止未认证客户端发送大帧撑大内存。
+	conn.SetReadLimit(65536)
 	conn.SetReadDeadline(time.Now().Add(h.authTimeout))
 	var authEnv protocol.Envelope
 	if err := conn.ReadJSON(&authEnv); err != nil {
@@ -504,24 +534,31 @@ func (h *Hub) handleSocket(conn *websocket.Conn) {
 		_ = conn.WriteJSON(protocol.NewEnvelope(protocol.TypeError, "server", "", protocol.ErrorPayload{Code: "load_failed", Message: "加载房间状态失败"}))
 		return
 	}
-	user.LastSeen = time.Now().UTC().Format(time.RFC3339Nano)
-	client := &Client{
-		id:        user.ID,
-		roomID:    roomID,
-		user:      user,
-		conn:      conn,
-		send:      make(chan protocol.Envelope, clientSendQueueSize),
-		hub:       h,
-		limiter:   rate.NewLimiter(rate.Limit(maxMessagesPerSecond), rateBurst),
-		JoinedAt:  time.Now(),
-	}
-	go client.writeLoop()
-	room, joined := h.joinRoom(client, state)
-	if !joined {
-		return
-	}
-	client.readLoop(room)
-	h.leaveRoom(room, client)
+		user.LastSeen = time.Now().UTC().Format(time.RFC3339Nano)
+		ctx, cancel := context.WithCancel(context.Background())
+		client := &Client{
+			id:        user.ID,
+			roomID:    roomID,
+			user:      user,
+			conn:      conn,
+			send:      make(chan protocol.Envelope, clientSendQueueSize),
+			hub:       h,
+			limiter:   rate.NewLimiter(rate.Limit(maxMessagesPerSecond), rateBurst),
+			JoinedAt:  time.Now(),
+			ctx:       ctx,
+			cancel:    cancel,
+		}
+		go client.writeLoop()
+		room, joined := h.joinRoom(client, state)
+		if !joined {
+			return
+		}
+		// 认证成功后释放读限制，允许后续大消息（snapshot/replay 等）。
+		if h.maxMessageBytes > 0 {
+			conn.SetReadLimit(h.maxMessageBytes)
+		}
+		client.readLoop(room)
+		h.leaveRoom(room, client)
 }
 
 func (h *Hub) roomKeyHash(roomID string, roomKey string) string {
@@ -537,6 +574,9 @@ func (h *Hub) room(roomID string) *Room {
 	defer h.mu.Unlock()
 	room := h.rooms[roomID]
 	if room == nil {
+		if h.maxGlobalRooms > 0 && len(h.rooms) >= h.maxGlobalRooms {
+			return nil
+		}
 		room = &Room{id: roomID, clients: make(map[string]*Client), pending: make(map[string]*PendingJoin)}
 		h.rooms[roomID] = room
 	}
@@ -581,14 +621,21 @@ func releaseRoomWrite(ch chan struct{}) {
 
 func (h *Hub) joinRoom(client *Client, state storage.RoomState) (*Room, bool) {
 	room := h.room(client.roomID)
+	if room == nil {
+		client.queue(protocol.NewEnvelope(protocol.TypeJoinRejected, "server", client.id, protocol.JoinRejectedPayload{Reason: "服务端房间数已达上限，请稍后重试"}))
+		client.shutdown()
+		return nil, false
+	}
 	room.mu.Lock()
 	requestedID := client.id
 	client.id = room.uniqueClientIDLocked(requestedID)
-	client.user.ID = client.id
+	u := client.getUser()
+	u.ID = client.id
 	isHost := room.hostID == ""
 	if isHost {
 		room.hostID = client.id
-		client.user.Role = "host"
+		u.Role = "host"
+		client.setUser(u)
 		peers := room.peersLocked(client.id)
 		room.clients[client.id] = client
 		client.queue(protocol.NewEnvelope(protocol.TypeAuthOK, "server", client.id, protocol.AuthOKPayload{
@@ -604,16 +651,23 @@ func (h *Hub) joinRoom(client *Client, state storage.RoomState) (*Room, bool) {
 		if requestedID != client.id {
 			log.Printf("collab client_id rewritten room=%s requested=%s assigned=%s", client.roomID, requestedID, client.id)
 		}
-		log.Printf("collab join room=%s client=%s role=%s host=%s peers_sent=%d notified=0 total=%d updates=%d compact_bytes=%d", client.roomID, client.id, client.user.Role, room.hostID, len(peers), total, len(state.Updates), len(state.CompactState))
+		log.Printf("collab join room=%s client=%s role=%s host=%s peers_sent=%d notified=0 total=%d updates=%d compact_bytes=%d", client.roomID, client.id, u.Role, room.hostID, len(peers), total, len(state.Updates), len(state.CompactState))
 		return room, true
 	}
-	client.user.Role = "collaborator"
+	u.Role = "collaborator"
+	client.setUser(u)
 	if requestedID != client.id {
 		log.Printf("collab client_id rewritten room=%s requested=%s assigned=%s", client.roomID, requestedID, client.id)
 	}
 	if room.closed {
 		room.mu.Unlock()
 		client.queue(protocol.NewEnvelope(protocol.TypeJoinRejected, "server", client.id, protocol.JoinRejectedPayload{Reason: "房间已关闭或房主已离线"}))
+		client.shutdown()
+		return room, false
+	}
+	if h.maxClientsPerRoom > 0 && len(room.clients) >= h.maxClientsPerRoom {
+		room.mu.Unlock()
+		client.queue(protocol.NewEnvelope(protocol.TypeJoinRejected, "server", client.id, protocol.JoinRejectedPayload{Reason: fmt.Sprintf("房间成员数已达上限 (%d)", h.maxClientsPerRoom)}))
 		client.shutdown()
 		return room, false
 	}
@@ -631,7 +685,7 @@ func (h *Hub) joinRoom(client *Client, state storage.RoomState) (*Room, bool) {
 	if hostClient != nil {
 		hostClient.queue(protocol.NewEnvelope(protocol.TypeJoinRequest, "server", hostClient.id, protocol.JoinRequestPayload{
 			RequestID: pending.requestID,
-			User:      client.user,
+			User:      client.getUser(),
 		}))
 	}
 	var decision joinDecision
@@ -666,8 +720,9 @@ func (h *Hub) joinRoom(client *Client, state storage.RoomState) (*Room, bool) {
 	}))
 	total := len(room.clients)
 	room.mu.Unlock()
-	delivered := room.broadcast(protocol.NewEnvelope(protocol.TypePeerJoined, "server", "", client.user), client.id)
-	log.Printf("collab join_approved room=%s client=%s role=%s host=%s request=%s peers_sent=%d notified=%d total=%d updates=%d compact_bytes=%d", client.roomID, client.id, client.user.Role, room.hostID, pending.requestID, len(peers), delivered, total, len(pending.state.Updates), len(pending.state.CompactState))
+	delivered := room.broadcast(protocol.NewEnvelope(protocol.TypePeerJoined, "server", "", client.getUser()), client.id)
+	user := client.getUser()
+	log.Printf("collab join_approved room=%s client=%s role=%s host=%s request=%s peers_sent=%d notified=%d total=%d updates=%d compact_bytes=%d", client.roomID, client.id, user.Role, room.hostID, pending.requestID, len(peers), delivered, total, len(pending.state.Updates), len(pending.state.CompactState))
 	return room, true
 }
 
@@ -759,7 +814,9 @@ func (h *Hub) tryHostMigrationLocked(room *Room) bool {
 	}
 	oldHostID := room.hostID
 	room.hostID = earliest.id
-	earliest.user.Role = "host"
+	u := earliest.getUser()
+	u.Role = "host"
+	earliest.setUser(u)
 	hostChangedEnv := protocol.NewEnvelope(protocol.TypeHostChanged, "server", "", protocol.HostChangedPayload{
 		NewHostID: earliest.id,
 		OldHostID: oldHostID,
@@ -777,7 +834,7 @@ func (room *Room) peersLocked(excludeID string) []protocol.User {
 		if id == excludeID {
 			continue
 		}
-		peers = append(peers, client.user)
+		peers = append(peers, client.getUser())
 	}
 	return peers
 }
@@ -863,6 +920,20 @@ func (client *Client) shutdown() {
 	})
 }
 
+// setUser 写入 client.user，对 presence handler（无 room.mu）和 joinRoom（持 room.mu）统一加锁，消除数据竞争。
+func (client *Client) setUser(u protocol.User) {
+	client.userMu.Lock()
+	client.user = u
+	client.userMu.Unlock()
+}
+
+// getUser 返回 client.user 的副本，消除与 presence handler 之间的数据竞争。
+func (client *Client) getUser() protocol.User {
+	client.userMu.RLock()
+	defer client.userMu.RUnlock()
+	return client.user
+}
+
 func isTransientEnvelope(env protocol.Envelope) bool {
 	return env.Type == protocol.TypePresence
 }
@@ -937,6 +1008,12 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 		if len(update) > 0 {
 			updateID := payload.UpdateID
 			go func() {
+				// 客户端断开后快速退出，避免 goroutine 泄漏。
+				select {
+				case <-client.ctx.Done():
+					return
+				default:
+				}
 				writeCh := client.hub.acquireRoomWrite(client.roomID)
 				if writeCh == nil {
 					// 写入串行化锁等待超时，回压客户端触发 Yjs 重同步。
@@ -945,14 +1022,16 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 					return
 				}
 				defer releaseRoomWrite(writeCh)
+				dbCtx, dbCancel := context.WithTimeout(client.ctx, 10*time.Second)
+				defer dbCancel()
 				// 写入前检查房间存储是否超限。
-				currentBytes, err := client.hub.store.RoomStorageBytes(context.Background(), client.roomID)
+				currentBytes, err := client.hub.store.RoomStorageBytes(dbCtx, client.roomID)
 				if err == nil && currentBytes+int64(len(update)) > client.hub.roomMaxStorageBytes {
 					log.Printf("collab room_storage_exceeded room=%s current=%d new=%d limit=%d", client.roomID, currentBytes, len(update), client.hub.roomMaxStorageBytes)
 					client.queue(protocol.NewEnvelope(protocol.TypeDocUpdateRejected, "server", client.id, protocol.DocUpdateRejectedPayload{UpdateID: updateID, Reason: "房间存储空间已满"}))
 					return
 				}
-				seq, err := client.hub.store.AppendUpdate(context.Background(), client.roomID, update)
+				seq, err := client.hub.store.AppendUpdate(dbCtx, client.roomID, update)
 				if err != nil {
 					log.Printf("collab append_update failed room=%s client=%s bytes=%d err=%v", client.roomID, client.id, len(update), err)
 					// 写库失败回压：通知来源客户端，触发 Yjs 自愈重同步。
@@ -986,6 +1065,12 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 			return
 		}
 		go func() {
+			// 客户端断开后快速退出。
+			select {
+			case <-client.ctx.Done():
+				return
+			default:
+			}
 			writeCh := client.hub.acquireRoomWrite(client.roomID)
 			if writeCh == nil {
 				log.Printf("collab snapshot_acquire_timeout room=%s client=%s bytes=%d", client.roomID, client.id, len(state))
@@ -993,11 +1078,20 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 				return
 			}
 			defer releaseRoomWrite(writeCh)
-			if err := client.hub.store.SaveSnapshot(context.Background(), client.roomID, state); err != nil {
+			dbCtx, dbCancel := context.WithTimeout(client.ctx, 10*time.Second)
+			defer dbCancel()
+			// 检查房间存储是否超限，与 doc_update 保持一致。
+			currentBytes, err := client.hub.store.RoomStorageBytes(dbCtx, client.roomID)
+			if err == nil && currentBytes+int64(len(state)) > client.hub.roomMaxStorageBytes {
+				log.Printf("collab snapshot_storage_exceeded room=%s current=%d new=%d limit=%d", client.roomID, currentBytes, len(state), client.hub.roomMaxStorageBytes)
+				client.sendError("room_storage_full", "房间存储空间已满，快照保存被拒绝")
+				return
+			}
+			if err := client.hub.store.SaveSnapshot(dbCtx, client.roomID, state, payload.BaseSeq); err != nil {
 				log.Printf("collab save_snapshot failed room=%s client=%s bytes=%d err=%v", client.roomID, client.id, len(state), err)
 				return
 			}
-			log.Printf("collab snapshot saved room=%s client=%s bytes=%d", client.roomID, client.id, len(state))
+			log.Printf("collab snapshot saved room=%s client=%s bytes=%d base_seq=%d", client.roomID, client.id, len(state), payload.BaseSeq)
 		}()
 	case protocol.TypePresence:
 		payload, err := protocol.DecodePayload[protocol.PresencePayload](env)
@@ -1007,7 +1101,15 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 		}
 		payload.User.ID = client.id
 		payload.User.LastSeen = time.Now().UTC().Format(time.RFC3339Nano)
-		client.user = payload.User
+		// 强制覆盖 Role，防止客户端伪造。
+		room.mu.RLock()
+		if client.id == room.hostID {
+			payload.User.Role = "host"
+		} else {
+			payload.User.Role = "collaborator"
+		}
+		room.mu.RUnlock()
+		client.setUser(payload.User)
 		if raw, err := json.Marshal(payload); err != nil {
 			log.Printf("collab marshal_presence_failed room=%s client=%s err=%v", client.roomID, client.id, err)
 			return
@@ -1022,6 +1124,14 @@ func (client *Client) handleEnvelope(room *Room, env protocol.Envelope) {
 			return
 		}
 		payload.User.ID = client.id
+		// 强制覆盖 Role，防止客户端伪造。
+		room.mu.RLock()
+		if client.id == room.hostID {
+			payload.User.Role = "host"
+		} else {
+			payload.User.Role = "collaborator"
+		}
+		room.mu.RUnlock()
 		// 清洗聊天文本，防止单条消息撑大广播数据。
 		payload.Text = protocol.CleanText(payload.Text, "", 4096)
 		if payload.Text == "" {
@@ -1161,7 +1271,9 @@ func (h *Hub) broadcastSyncRequest(room *Room) {
 }
 
 func (client *Client) maybeAutoCompact() {
-	count, err := client.hub.store.UpdateCount(context.Background(), client.roomID)
+	dbCtx, dbCancel := context.WithTimeout(client.ctx, 5*time.Second)
+	defer dbCancel()
+	count, err := client.hub.store.UpdateCount(dbCtx, client.roomID)
 	if err != nil || count < autoCompactUpdateThreshold {
 		return
 	}

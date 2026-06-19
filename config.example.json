@@ -18,6 +18,8 @@
   "roomTTLDays": 30,
   "cleanupInterval": "1h",
   "maxRoomsPerIPPerMinute": 10,
+  "maxClientsPerRoom": 20,
+  "maxGlobalRooms": 0,
   "allowedServerHosts": [],
   "insecureAllowDefaultSecret": false
 }

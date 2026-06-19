@@ -25,8 +25,10 @@ type Store interface {
 	LoadRoomState(ctx context.Context, roomID string) (RoomState, error)
 	// AppendUpdate 原子追加一条 Yjs update，并返回房间内递增序号。
 	AppendUpdate(ctx context.Context, roomID string, update []byte) (int64, error)
-	// SaveSnapshot 保存 compact snapshot，并清理已被压缩的增量。
-	SaveSnapshot(ctx context.Context, roomID string, state []byte) error
+	// SaveSnapshot 保存 compact snapshot，baseSeq 为快照覆盖的最大 update seq；
+	// 只删除 seq <= baseSeq 的增量，保留快照生成期间其他客户端新 append 的高 seq 增量。
+	// baseSeq <= 0 时兼容旧客户端，删除全部增量。
+	SaveSnapshot(ctx context.Context, roomID string, state []byte, baseSeq int64) error
 	// CloseRoom 标记房间关闭。关闭后的房间不允许旧 roomKey 再次加入。
 	CloseRoom(ctx context.Context, roomID string) error
 	// UpdateCount 返回指定房间的增量 update 条数，用于触发自动 compact。

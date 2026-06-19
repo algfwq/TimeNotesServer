@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"fmt"
 	"os"
@@ -103,13 +104,13 @@ func (s *Store) EnsureRoom(ctx context.Context, roomID string, keyHash string) e
 	var existing string
 	var closedAt sql.NullString
 	err = tx.QueryRowContext(ctx, `SELECT key_hash, closed_at FROM rooms WHERE room_id = ?`, roomID).Scan(&existing, &closedAt)
-	if err == nil {
-		if closedAt.Valid && closedAt.String != "" {
-			return storage.ErrRoomClosed
-		}
-		if existing != keyHash {
-			return storage.ErrRoomKeyMismatch
-		}
+		if err == nil {
+			if closedAt.Valid && closedAt.String != "" {
+				return storage.ErrRoomClosed
+			}
+			if subtle.ConstantTimeCompare([]byte(existing), []byte(keyHash)) != 1 {
+				return storage.ErrRoomKeyMismatch
+			}
 		_, err = tx.ExecContext(ctx, `UPDATE rooms SET updated_at = ? WHERE room_id = ?`, now, roomID)
 		if err != nil {
 			return err
@@ -168,28 +169,36 @@ func (s *Store) AppendUpdate(ctx context.Context, roomID string, update []byte) 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO room_updates(room_id, seq, update_blob, created_at) VALUES(?, ?, ?, ?)`, roomID, seq, update, now); err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE rooms SET update_seq = ?, updated_at = ? WHERE room_id = ?`, seq, now, roomID); err != nil {
+	updateLen := int64(len(update))
+	if _, err := tx.ExecContext(ctx, `UPDATE rooms SET update_seq = ?, storage_bytes = storage_bytes + ?, update_count = update_count + 1, updated_at = ? WHERE room_id = ?`, seq, updateLen, now, roomID); err != nil {
 		return 0, err
 	}
 	return seq, tx.Commit()
 }
 
-func (s *Store) SaveSnapshot(ctx context.Context, roomID string, state []byte) error {
+func (s *Store) SaveSnapshot(ctx context.Context, roomID string, state []byte, baseSeq int64) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, `UPDATE rooms SET compact_state = ?, updated_at = ? WHERE room_id = ? AND closed_at IS NULL`, state, now, roomID)
+	result, err := tx.ExecContext(ctx, `UPDATE rooms SET compact_state = ?, storage_bytes = LENGTH(?), update_count = 0, updated_at = ? WHERE room_id = ? AND closed_at IS NULL`, state, state, now, roomID)
 	if err != nil {
 		return err
 	}
 	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
 		return storage.ErrRoomClosed
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM room_updates WHERE room_id = ?`, roomID); err != nil {
-		return err
+	if baseSeq > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM room_updates WHERE room_id = ? AND seq <= ?`, roomID, baseSeq); err != nil {
+			return err
+		}
+	} else {
+		// 兼容旧客户端不传 baseSeq：删除全部增量（保守行为）
+		if _, err := tx.ExecContext(ctx, `DELETE FROM room_updates WHERE room_id = ?`, roomID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -202,29 +211,41 @@ func (s *Store) CloseRoom(ctx context.Context, roomID string) error {
 
 func (s *Store) UpdateCount(ctx context.Context, roomID string) (int, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM room_updates WHERE room_id = ?`, roomID).Scan(&count)
-	return count, err
+	err := s.db.QueryRowContext(ctx, `SELECT update_count FROM rooms WHERE room_id = ?`, roomID).Scan(&count)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return count, nil
 }
 
 func (s *Store) RoomStorageBytes(ctx context.Context, roomID string) (int64, error) {
 	var total int64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(LENGTH(compact_state),0) + COALESCE((SELECT SUM(LENGTH(update_blob)) FROM room_updates WHERE room_id = ?),0)`, roomID).Scan(&total)
-	return total, err
+	err := s.db.QueryRowContext(ctx, `SELECT storage_bytes FROM rooms WHERE room_id = ?`, roomID).Scan(&total)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return total, nil
 }
 
 func (s *Store) DeleteInactiveRooms(ctx context.Context, cutoff time.Time) (int, error) {
 	cutoffStr := cutoff.UTC().Format(time.RFC3339Nano)
-	// 显式删除关联的 room_updates 行；即使 _foreign_keys 已启用，也避免依赖级联以兼容历史部署。
-	// 先删子表再删父表，按 updated_at 早于 cutoff 的已关闭房间过滤。
+	// 按 updated_at 清理不活跃房间（含从未有连接的孤儿房间和已关闭的旧房间）。
+	// 先删子表再删父表，即使 _foreign_keys 已启用也避免依赖级联以兼容历史部署。
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM room_updates WHERE room_id IN (SELECT room_id FROM rooms WHERE closed_at IS NOT NULL AND updated_at < ?)`, cutoffStr); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM room_updates WHERE room_id IN (SELECT room_id FROM rooms WHERE updated_at < ?)`, cutoffStr); err != nil {
 		return 0, err
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM rooms WHERE closed_at IS NOT NULL AND updated_at < ?`, cutoffStr)
+	result, err := tx.ExecContext(ctx, `DELETE FROM rooms WHERE updated_at < ?`, cutoffStr)
 	if err != nil {
 		return 0, err
 	}

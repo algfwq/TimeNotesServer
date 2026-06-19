@@ -82,6 +82,8 @@ func main() {
 		CleanupInterval:        cfg.CleanupInterval,
 		MaxRoomsPerIPPerMinute:  cfg.MaxRoomsPerIPPerMinute,
 		MaxWSConnPerIPPerMinute: cfg.MaxWSConnPerIPPerMinute,
+		MaxClientsPerRoom:       cfg.MaxClientsPerRoom,
+		MaxGlobalRooms:          cfg.MaxGlobalRooms,
 		AllowedServerHosts:     cfg.AllowedServerHosts,
 		TrustedProxies:         cfg.TrustedProxies,
 	})
